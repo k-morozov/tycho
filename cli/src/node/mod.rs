@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures_util::future;
 use futures_util::future::BoxFuture;
@@ -11,7 +11,9 @@ use tycho_collator::collator::CollatorStdImplFactory;
 use tycho_collator::internal_queue::queue::{QueueConfig, QueueFactory, QueueFactoryStdImpl};
 use tycho_collator::internal_queue::state::storage::QueueStateImplFactory;
 use tycho_collator::manager::CollationManager;
-use tycho_collator::mempool::MempoolAdapterStdImpl;
+use tycho_collator::mempool::{
+    MempoolAdapterSingleNodeImpl, MempoolAdapterStdImpl, WrapperMempoolAdapter,
+};
 use tycho_collator::queue_adapter::{MessageQueueAdapter, MessageQueueAdapterStdImpl};
 use tycho_collator::state_node::{CollatorSyncContext, StateNodeAdapter, StateNodeAdapterStdImpl};
 use tycho_collator::types::CollatorConfig;
@@ -57,6 +59,8 @@ pub struct Node {
 
     /// Path to the work units tuner config.
     wu_tuner_config_path: PathBuf,
+
+    is_single_node: bool,
 }
 
 impl Node {
@@ -69,22 +73,39 @@ impl Node {
         control_socket: PathBuf,
         wu_tuner_config_path: PathBuf,
     ) -> Result<Self> {
+        let is_single_node = node_config.single_node;
+        tracing::info!("call new: single_node {is_single_node}");
+
         let base = NodeBase::builder(&node_config.base, &global_config)
             .init_network(public_addr, &keys.as_secret())?
             .init_storage()
             .await?;
 
-        // Setup blockchain rpc
-        let rpc_mempool_adapter = RpcMempoolAdapter {
-            inner: Arc::new(MempoolAdapterStdImpl::new(
-                base.keypair().clone(),
-                base.network(),
-                base.peer_resolver(),
-                base.overlay_service(),
-                base.storage_context(),
-                &node_config.mempool,
-            )?),
+        let rpc_mempool_adapter = if is_single_node {
+            let node_peer_info = global_config
+                .bootstrap_peers
+                .first()
+                .ok_or_else(|| anyhow!("Failed get config for first node"))?;
+
+            RpcMempoolAdapter {
+                inner: Arc::new(MempoolAdapterSingleNodeImpl::new(
+                    &node_config.mempool,
+                    node_peer_info,
+                )?),
+            }
+        } else {
+            RpcMempoolAdapter {
+                inner: Arc::new(MempoolAdapterStdImpl::new(
+                    base.keypair().clone(),
+                    base.network(),
+                    base.peer_resolver(),
+                    base.overlay_service(),
+                    base.storage_context(),
+                    &node_config.mempool,
+                )?),
+            }
         };
+
         let base = base
             .init_blockchain_rpc(rpc_mempool_adapter.clone(), rpc_mempool_adapter.clone())?
             .build()?;
@@ -105,6 +126,7 @@ impl Node {
             internal_queue_config: node_config.internal_queue,
             mempool_config_override: global_config.mempool,
             wu_tuner_config_path,
+            is_single_node,
         })
     }
 
@@ -119,9 +141,12 @@ impl Node {
 
     /// Initialize the node and return the init block id.
     pub async fn boot(&self, zerostates: Option<Vec<PathBuf>>) -> Result<BlockId> {
-        let boot_type = self
-            .overwrite_cold_boot_type
-            .unwrap_or(ColdBootType::LatestPersistent);
+        let boot_type = if !self.is_single_node {
+            self.overwrite_cold_boot_type
+                .unwrap_or(ColdBootType::LatestPersistent)
+        } else {
+            ColdBootType::Genesis
+        };
 
         self.base
             .boot(
@@ -153,16 +178,12 @@ impl Node {
 
         // Create mempool adapter
         let mempool_adapter = self.rpc_mempool_adapter.inner.clone();
+
         if let Some(global) = self.mempool_config_override.as_ref() {
-            let future = mempool_adapter.set_config(|config| {
-                if let Some(consensus_config) = &global.consensus_config {
-                    config.set_consensus_config(consensus_config)?;
-                } // else: will be set from mc state after sync
-                config.set_genesis(global.genesis_info);
-                Ok::<_, anyhow::Error>(())
-            });
-            future.await?;
-        };
+            mempool_adapter
+                .update_config(&global.consensus_config, &global.genesis_info)
+                .await?;
+        }
 
         // Create RPC
         let (rpc_block_subscriber, rpc_state_subscriber) = if let Some(config) = &self.rpc_config {
@@ -291,6 +312,8 @@ impl Node {
         // blockchain_block_provider =
         //     blockchain_block_provider.with_fallback(archive_block_provider.clone());
 
+        tracing::info!("archive_block_provider started");
+
         let archive_block_provider = base.build_archive_block_provider();
         let blockchain_block_provider = base.build_blockchain_block_provider();
         let storage_block_provider = base.build_storage_block_provider();
@@ -415,9 +438,16 @@ impl tycho_control::Collator for CollatorControl {
     }
 }
 
-#[derive(Clone)]
 struct RpcMempoolAdapter {
-    inner: Arc<MempoolAdapterStdImpl>,
+    inner: Arc<dyn WrapperMempoolAdapter>,
+}
+
+impl Clone for RpcMempoolAdapter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl BroadcastListener for RpcMempoolAdapter {

@@ -5,6 +5,8 @@ mod deduplicator;
 mod parser;
 mod state_update_queue;
 
+use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -15,15 +17,16 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::Instrument;
 use tycho_consensus::prelude::*;
 use tycho_crypto::ed25519::KeyPair;
-use tycho_network::{Network, OverlayService, PeerResolver};
+use tycho_network::{Network, OverlayService, PeerInfo, PeerResolver};
 use tycho_storage::StorageContext;
+use tycho_types::models::{ConsensusConfig, GenesisInfo};
 
-use crate::mempool::impls::std_impl::anchor_handler::AnchorHandler;
+use crate::mempool::impls::std_impl::anchor_handler::{AnchorHandler, AnchorSingleNodeHandler};
 use crate::mempool::impls::std_impl::cache::Cache;
 use crate::mempool::impls::std_impl::config::ConfigAdapter;
 use crate::mempool::{
-    DebugStateUpdateContext, GetAnchorResult, MempoolAdapter, MempoolAdapterFactory,
-    MempoolAnchorId, MempoolEventListener, StateUpdateContext,
+    DebugStateUpdateContext, GetAnchorResult, MempoolAdapter, MempoolAnchorId, StateUpdateContext,
+    WrapperMempoolAdapter,
 };
 use crate::tracing_targets;
 use crate::types::processed_upto::BlockSeqno;
@@ -68,16 +71,6 @@ impl MempoolAdapterStdImpl {
             input_buffer: InputBuffer::default(),
             top_known_anchor: RoundWatch::default(),
         })
-    }
-
-    /// **Warning:** changes from `GlobalConfig` may be rewritten by applied mc state
-    /// only if applied mc state has greater time and GEQ round
-    pub async fn set_config<F, R>(&self, fun: F) -> R
-    where
-        F: FnOnce(&mut MempoolConfigBuilder) -> R,
-    {
-        let mut config_guard = self.config.lock().await;
-        fun(&mut config_guard.builder)
     }
 
     async fn process_state_update(
@@ -250,17 +243,30 @@ impl MempoolAdapterStdImpl {
 
         Ok(session)
     }
-
-    pub fn send_external(&self, message: Bytes) {
-        self.input_buffer.push(message);
-    }
 }
 
-impl MempoolAdapterFactory for Arc<MempoolAdapterStdImpl> {
-    type Adapter = MempoolAdapterStdImpl;
+#[async_trait::async_trait]
+impl WrapperMempoolAdapter for MempoolAdapterStdImpl {
+    fn send_external(&self, message: Bytes) {
+        self.input_buffer.push(message);
+    }
 
-    fn create(&self, _listener: Arc<dyn MempoolEventListener>) -> Arc<Self::Adapter> {
-        self.clone()
+    /// **Warning:** changes from `GlobalConfig` may be rewritten by applied mc state
+    /// only if applied mc state has greater time and GEQ round
+    async fn update_config(
+        &self,
+        consensus_config: &Option<ConsensusConfig>,
+        genesis_info: &GenesisInfo,
+    ) -> Result<()> {
+        let mut config_guard = self.config.lock().await;
+        if let Some(consensus_config) = &consensus_config {
+            config_guard
+                .builder
+                .set_consensus_config(consensus_config)?;
+        } // else: will be set from mc state after sync
+
+        config_guard.builder.set_genesis(*genesis_info);
+        Ok::<_, anyhow::Error>(())
     }
 }
 
@@ -331,6 +337,199 @@ impl MempoolAdapter for MempoolAdapterStdImpl {
 
     fn clear_anchors_cache(&self, before_anchor_id: MempoolAnchorId) -> Result<()> {
         self.cache.clear(before_anchor_id);
+        Ok(())
+    }
+}
+
+pub struct MempoolAdapterSingleNodeImpl(Arc<Inner>);
+
+struct Inner {
+    cache: Arc<Cache>,
+    config: Mutex<ConfigAdapter>,
+    node_peer_info: PeerInfo,
+
+    unprocessed_message_queue: Arc<std::sync::Mutex<VecDeque<Bytes>>>,
+    anchor_id: tokio::sync::Mutex<Cell<MempoolAnchorId>>,
+
+    once_flag: std::sync::Once,
+}
+
+impl Inner {
+    pub async fn start_process(&self) {
+        let consensus_config = {
+            let config_guard = self.config.lock().await;
+            let consensus_config = config_guard
+                .builder
+                .get_consensus_config()
+                .expect("There is no consensus config.");
+            consensus_config.clone()
+        };
+
+        let timeout = consensus_config.broadcast_retry_millis as u64; // * attempts
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(timeout));
+
+        loop {
+            interval.tick().await;
+
+            let external_messages = {
+                let mut messages = self.unprocessed_message_queue.lock().unwrap();
+                let external_messages: Vec<Bytes> = messages.drain(..).collect();
+                external_messages
+            };
+
+            let anchor_id = {
+                let guard = self.anchor_id.lock().await;
+                let anchor_id = guard.take();
+                guard.replace(anchor_id + 1);
+                anchor_id
+            };
+
+            let mut anchor_task =
+                AnchorSingleNodeHandler::new(&consensus_config, self.node_peer_info.id, anchor_id)
+                    .run(self.cache.clone(), external_messages)
+                    .boxed();
+
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = &mut anchor_task => {}, // just poll
+                }
+            });
+
+            tracing::info!(target: tracing_targets::MEMPOOL_ADAPTER, "Mempool started");
+        }
+    }
+}
+
+impl MempoolAdapterSingleNodeImpl {
+    pub fn new(mempool_node_config: &MempoolNodeConfig, node_peer_info: &PeerInfo) -> Result<Self> {
+        let config_builder = MempoolConfigBuilder::new(mempool_node_config);
+        Ok(Self(Arc::new(Inner {
+            cache: Default::default(),
+            config: Mutex::new(ConfigAdapter {
+                builder: config_builder,
+                state_update_queue: Default::default(),
+                engine_session: None,
+            }),
+            node_peer_info: node_peer_info.clone(),
+            unprocessed_message_queue: Arc::new(Default::default()),
+            anchor_id: tokio::sync::Mutex::new(Cell::new(0)),
+            once_flag: std::sync::Once::new(),
+        })))
+    }
+}
+
+#[async_trait::async_trait]
+impl WrapperMempoolAdapter for MempoolAdapterSingleNodeImpl {
+    fn send_external(&self, message: Bytes) {
+        let mut queue = self.0.unprocessed_message_queue.lock().unwrap();
+        queue.push_back(message);
+    }
+    async fn update_config(
+        &self,
+        consensus_config: &Option<ConsensusConfig>,
+        genesis_info: &GenesisInfo,
+    ) -> Result<()> {
+        let mut config_guard = self.0.config.lock().await;
+        if let Some(consensus_config) = &consensus_config {
+            config_guard
+                .builder
+                .set_consensus_config(consensus_config)?;
+        } // else: will be set from mc state after sync
+
+        config_guard.builder.set_genesis(*genesis_info);
+        Ok::<_, anyhow::Error>(())
+    }
+}
+
+#[async_trait::async_trait]
+impl MempoolAdapter for MempoolAdapterSingleNodeImpl {
+    async fn handle_mc_state_update(
+        &self,
+        new_cx: crate::mempool::StateUpdateContext,
+    ) -> anyhow::Result<()> {
+        tracing::info!("call handle_mc_state_update");
+
+        tracing::debug!(
+            target: tracing_targets::MEMPOOL_ADAPTER,
+            full_id = %new_cx.mc_block_id,
+            "Received state update from mc block",
+        );
+
+        {
+            let cfg = &new_cx.consensus_config;
+            tracing::info!("handle_mc_state_update: consensus config={:?}", cfg);
+
+            let mut config_guard = self.0.config.lock().await;
+            config_guard
+                .builder
+                .set_consensus_config(&new_cx.consensus_config)?;
+        }
+
+        self.0.once_flag.call_once(|| {
+            let inner = self.0.clone();
+            tokio::spawn(async move {
+                let proccess_task = inner.start_process().boxed();
+                tokio::select! {
+                    () = proccess_task => {},
+                }
+            });
+        });
+
+        tracing::info!("future for start_process was created");
+
+        Ok(())
+    }
+
+    async fn handle_signed_mc_block(
+        &self,
+        _mc_block_seqno: crate::types::processed_upto::BlockSeqno,
+    ) -> anyhow::Result<()> {
+        tracing::info!("call handle_signed_mc_block");
+        Ok(())
+    }
+
+    async fn get_anchor_by_id(
+        &self,
+        anchor_id: crate::mempool::MempoolAnchorId,
+    ) -> anyhow::Result<crate::mempool::GetAnchorResult> {
+        tracing::debug!(
+            target: tracing_targets::MEMPOOL_ADAPTER,
+            %anchor_id,
+            "get_anchor_by_id"
+        );
+
+        let result = match self.0.cache.get_anchor_by_id(anchor_id).await {
+            Some(anchor) => GetAnchorResult::Exist(anchor),
+            None => GetAnchorResult::NotExist,
+        };
+
+        Ok(result)
+    }
+
+    async fn get_next_anchor(
+        &self,
+        prev_anchor_id: crate::mempool::MempoolAnchorId,
+    ) -> anyhow::Result<crate::mempool::GetAnchorResult> {
+        tracing::debug!(
+            target: tracing_targets::MEMPOOL_ADAPTER,
+            %prev_anchor_id,
+            "get_next_anchor"
+        );
+
+        let result = match self.0.cache.get_next_anchor(prev_anchor_id).await? {
+            Some(anchor) => GetAnchorResult::Exist(anchor),
+            None => GetAnchorResult::NotExist,
+        };
+
+        Ok(result)
+    }
+
+    fn clear_anchors_cache(
+        &self,
+        before_anchor_id: crate::mempool::MempoolAnchorId,
+    ) -> anyhow::Result<()> {
+        self.0.cache.clear(before_anchor_id);
         Ok(())
     }
 }

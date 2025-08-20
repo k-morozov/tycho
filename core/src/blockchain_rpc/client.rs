@@ -491,6 +491,8 @@ impl BlockchainRpcClient {
             .neighbours()
             .choose_multiple(NEIGHBOUR_COUNT, NeighbourType::Reliable);
 
+        tracing::info!(target = "find_archive", "step #1");
+
         // Find a neighbour which has the requested archive
         let pending_archive = 'info: {
             let req = Request::from_tl(rpc::GetArchiveInfo { mc_seqno });

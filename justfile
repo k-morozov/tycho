@@ -109,6 +109,10 @@ repack_heavy_archives:
 clean_integration_tests:
     rm -rf {{ integration_test_dir }}
 
+# Removes all files for network.
+clean_temp:
+    rm -rf {{ local_network_dir }}
+
 # === Local network stuff ===
 
 # Builds the node and prints a path to the binary. Use `TYCHO_BUILD_PROFILE` env to explicitly set cargo profile.

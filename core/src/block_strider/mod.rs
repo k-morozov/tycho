@@ -173,7 +173,7 @@ where
             }
         }
 
-        tracing::info!("block strider loop finished");
+        tracing::debug!("block strider loop finished");
         Ok(())
     }
 
@@ -371,7 +371,7 @@ where
     ) -> impl Future<Output = OptionalBlockStuff> + Send + 'static {
         let _histogram = HistogramGuard::begin("tycho_core_download_mc_block_time");
 
-        tracing::debug!(%prev_block_id, "fetching next master block");
+        tracing::info!(%prev_block_id, "fetching next master block");
 
         let provider = self.provider.clone();
         let prev_block_id = *prev_block_id;

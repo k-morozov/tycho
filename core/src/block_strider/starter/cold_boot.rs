@@ -38,8 +38,6 @@ impl StarterInner {
     where
         P: ZerostateProvider,
     {
-        tracing::info!("started");
-
         let last_mc_block_id = match boot_type {
             ColdBootType::Genesis => {
                 let node_state = self.storage.node_state();

@@ -57,6 +57,9 @@ pub struct NodeBaseConfig {
     pub archive_block_provider: ArchiveBlockProviderConfig,
 
     pub blockchain_block_provider: BlockchainBlockProviderConfig,
+
+    // @todo option?
+    pub single_node: bool,
 }
 
 impl Default for NodeBaseConfig {
@@ -77,6 +80,7 @@ impl Default for NodeBaseConfig {
             blockchain_rpc_service: BlockchainRpcServiceConfig::default(),
             blockchain_block_provider: BlockchainBlockProviderConfig::default(),
             archive_block_provider: ArchiveBlockProviderConfig::default(),
+            single_node: false,
         }
     }
 }

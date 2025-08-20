@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use bytes::Bytes;
 use tycho_network::PeerId;
 use tycho_types::models::*;
 use tycho_types::prelude::*;
@@ -13,7 +14,7 @@ pub use self::state_update_context::*;
 use crate::types::processed_upto::BlockSeqno;
 
 mod impls {
-    pub use self::std_impl::MempoolAdapterStdImpl;
+    pub use self::std_impl::{MempoolAdapterSingleNodeImpl, MempoolAdapterStdImpl};
     pub use self::stub_impl::MempoolAdapterStubImpl;
     #[cfg(test)]
     pub(crate) use self::stub_impl::{make_stub_anchor, make_stub_external};
@@ -25,22 +26,22 @@ mod impls {
 // === Factory ===
 
 pub trait MempoolAdapterFactory {
-    type Adapter: MempoolAdapter;
+    // type Adapter: MempoolAdapter;
 
-    fn create(&self, listener: Arc<dyn MempoolEventListener>) -> Arc<Self::Adapter>;
+    fn create(&self, listener: Arc<dyn MempoolEventListener>) -> Arc<dyn MempoolAdapter>;
 }
 
-impl<F, R> MempoolAdapterFactory for F
-where
-    F: Fn(Arc<dyn MempoolEventListener>) -> Arc<R>,
-    R: MempoolAdapter,
-{
-    type Adapter = R;
+// impl<F, R> MempoolAdapterFactory for F
+// where
+//     F: Fn(Arc<dyn MempoolEventListener>) -> Arc<R>,
+//     R: MempoolAdapter,
+// {
+//     type Adapter = R;
 
-    fn create(&self, listener: Arc<dyn MempoolEventListener>) -> Arc<Self::Adapter> {
-        self(listener)
-    }
-}
+//     fn create(&self, listener: Arc<dyn MempoolEventListener>) -> Arc<Self::Adapter> {
+//         self(listener)
+//     }
+// }
 
 // === Events Listener ===
 
@@ -51,6 +52,24 @@ pub trait MempoolEventListener: Send + Sync {
 }
 
 // === Adapter ===
+
+#[async_trait::async_trait]
+pub trait WrapperMempoolAdapter: MempoolAdapter {
+    fn send_external(&self, message: Bytes);
+    async fn update_config(
+        &self,
+        consensus_config: &Option<ConsensusConfig>,
+        genesis_info: &GenesisInfo,
+    ) -> Result<()>;
+}
+
+impl MempoolAdapterFactory for Arc<dyn WrapperMempoolAdapter> {
+    // type Adapter = dyn WrapperMempoolAdapter;
+
+    fn create(&self, _listener: Arc<dyn MempoolEventListener>) -> Arc<dyn MempoolAdapter> {
+        self.clone()
+    }
+}
 
 #[async_trait]
 pub trait MempoolAdapter: Send + Sync + 'static {
